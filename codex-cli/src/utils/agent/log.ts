@@ -13,9 +13,29 @@ interface Logger {
 class AsyncLogger implements Logger {
   private queue: Array<string> = [];
   private isWriting: boolean = false;
+  private localFilePath: string | null = null;
 
-  constructor(private filePath: string) {
+  constructor(private filePath: string, useLocalLogs: boolean = false) {
     this.filePath = filePath;
+
+    // Set up local directory logging if enabled
+    if (useLocalLogs) {
+      try {
+        // Use current working directory for local logs
+        const cwd = process.cwd();
+        this.localFilePath = path.join(cwd, `codex-log-${now()}.log`);
+        // Create an empty file to start
+        fsSync.writeFileSync(this.localFilePath, "");
+        // Use process.stderr directly instead of console
+        process.stderr.write(
+          `Local logging enabled. Logs will be written to: ${this.localFilePath}\n`,
+        );
+      } catch (err) {
+        // Use process.stderr directly instead of console
+        process.stderr.write(`Failed to set up local logging: ${err}\n`);
+        this.localFilePath = null;
+      }
+    }
   }
 
   isLoggingEnabled(): boolean {
@@ -38,7 +58,16 @@ class AsyncLogger implements Logger {
     this.queue = [];
 
     try {
+      // Write to the standard log location
       await fs.appendFile(this.filePath, messages);
+
+      // Also write to local file if enabled
+      if (this.localFilePath) {
+        await fs.appendFile(this.localFilePath, messages);
+      }
+    } catch (err) {
+      // Log error to stderr directly instead of using console
+      process.stderr.write(`Error writing logs: ${err}\n`);
     } finally {
       this.isWriting = false;
     }
@@ -76,6 +105,9 @@ let logger: Logger;
  *
  * - Mac/Windows: `tail -F "$TMPDIR/oai-codex/codex-cli-latest.log"`
  * - Linux: `tail -F ~/.local/oai-codex/codex-cli-latest.log`
+ *
+ * When LOCAL_LOGS=1 is set in the environment, it will also create logs in the
+ * current working directory.
  */
 export function initLogger(): Logger {
   if (logger) {
@@ -84,6 +116,10 @@ export function initLogger(): Logger {
     logger = new EmptyLogger();
     return logger;
   }
+
+  // Check if local logging is enabled
+  const useLocalLogs =
+    process.env["LOCAL_LOGS"] === "1" || process.env["LOCAL_LOGS"] === "true";
 
   const isMac = process.platform === "darwin";
   const isWin = process.platform === "win32";
@@ -116,7 +152,7 @@ export function initLogger(): Logger {
     }
   }
 
-  logger = new AsyncLogger(logFile);
+  logger = new AsyncLogger(logFile, useLocalLogs);
   return logger;
 }
 

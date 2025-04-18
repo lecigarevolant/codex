@@ -5,9 +5,6 @@ import type {
   ResponseFunctionToolCall,
   ResponseInputItem,
   ResponseItem,
-  // Using any type for these since they're not exported correctly
-  ResponseWebSearchCall as _ResponseWebSearchCall,
-  ResponseMessage as AnyResponseMessage,
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
 
@@ -30,6 +27,63 @@ const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
   process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "2500",
   10,
 );
+
+// Define more specific types for our tool calls
+type ResponseWebSearchCall = ResponseItem & {
+  type: "web_search_call";
+  id: string;
+};
+
+/**
+ * Interface for handling different types of tool calls from the model.
+ * Each handler knows how to process a specific type of tool call and
+ * produce response input items for the next turn.
+ */
+interface ToolHandler<T extends ResponseItem> {
+  /** Return true if this item belongs to the handler. */
+  canHandle(item: ResponseItem): item is T;
+
+  /**
+   * Do the side-effect (run command, query DB, etc.) and return the
+   * ResponseInputItems that constitute the "tool output".
+   */
+  handle(item: T): Promise<Array<ResponseInputItem>>;
+}
+
+/**
+ * Handles function calls like 'shell' commands
+ */
+class FunctionCallHandler implements ToolHandler<ResponseItem> {
+  constructor(private agentLoop: AgentLoop) {}
+
+  canHandle(item: ResponseItem): item is ResponseItem {
+    return item.type === "function_call";
+  }
+
+  async handle(item: ResponseItem): Promise<Array<ResponseInputItem>> {
+    // Cast to ResponseFunctionToolCall for handleFunctionCall
+    return this.agentLoop.handleFunctionCall(item as ResponseFunctionToolCall);
+  }
+}
+
+/**
+ * Handles web search calls
+ */
+class WebSearchHandler implements ToolHandler<ResponseWebSearchCall> {
+  canHandle(item: ResponseItem): item is ResponseWebSearchCall {
+    return item.type === "web_search_call";
+  }
+
+  async handle(item: ResponseWebSearchCall): Promise<Array<ResponseInputItem>> {
+    if (isLoggingEnabled()) {
+      log(`WebSearchHandler: Handling web_search_call ID: ${item.id}`);
+    }
+
+    // Web search calls don't need an explicit response like function calls do
+    // The OpenAI API handles these automatically
+    return [];
+  }
+}
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -101,101 +155,9 @@ export class AgentLoop {
   private terminated = false;
   /** Master abort controller – fires when terminate() is invoked. */
   private readonly hardAbort = new AbortController();
-  /** Flag to track if the loop is waiting for web search results */
-  private isWaitingForWebSearch: boolean = false;
 
-  /**
-   * Abort the ongoing request/stream, if any. This allows callers (typically
-   * the UI layer) to interrupt the current agent step so the user can issue
-   * new instructions without waiting for the model to finish.
-   */
-  public cancel(): void {
-    if (this.terminated) {
-      return;
-    }
-
-    // Reset the current stream to allow new requests
-    this.currentStream = null;
-    if (isLoggingEnabled()) {
-      log(
-        `AgentLoop.cancel() invoked – currentStream=${Boolean(
-          this.currentStream,
-        )} execAbortController=${Boolean(
-          this.execAbortController,
-        )} generation=${this.generation}`,
-      );
-    }
-    (
-      this.currentStream as { controller?: { abort?: () => void } } | null
-    )?.controller?.abort?.();
-
-    this.canceled = true;
-    this.isWaitingForWebSearch = false; // Reset web search state on cancel
-
-    // Abort any in-progress tool calls
-    this.execAbortController?.abort();
-
-    // Create a new abort controller for future tool calls
-    this.execAbortController = new AbortController();
-    if (isLoggingEnabled()) {
-      log("AgentLoop.cancel(): execAbortController.abort() called");
-    }
-
-    // NOTE: We intentionally do *not* clear `lastResponseId` here.  If the
-    // stream produced a `function_call` before the user cancelled, OpenAI now
-    // expects a corresponding `function_call_output` that must reference that
-    // very same response ID.  We therefore keep the ID around so the
-    // follow‑up request can still satisfy the contract.
-
-    // If we have *not* seen any function_call IDs yet there is nothing that
-    // needs to be satisfied in a follow‑up request.  In that case we clear
-    // the stored lastResponseId so a subsequent run starts a clean turn.
-    if (this.pendingAborts.size === 0) {
-      try {
-        this.onLastResponseId("");
-      } catch {
-        /* ignore */
-      }
-    }
-
-    this.onLoading(false);
-
-    /* Inform the UI that the run was aborted by the user. */
-    // const cancelNotice: ResponseItem = {
-    //   id: `cancel-${Date.now()}`,
-    //   type: "message",
-    //   role: "system",
-    //   content: [
-    //     {
-    //       type: "input_text",
-    //       text: "⏹️  Execution canceled by user.",
-    //     },
-    //   ],
-    // };
-    // this.onItem(cancelNotice);
-
-    this.generation += 1;
-    if (isLoggingEnabled()) {
-      log(`AgentLoop.cancel(): generation bumped to ${this.generation}`);
-    }
-  }
-
-  /**
-   * Hard‑stop the agent loop. After calling this method the instance becomes
-   * unusable: any in‑flight operations are aborted and subsequent invocations
-   * of `run()` will throw.
-   */
-  public terminate(): void {
-    if (this.terminated) {
-      return;
-    }
-    this.terminated = true;
-    this.isWaitingForWebSearch = false; // Reset web search state on terminate
-
-    this.hardAbort.abort();
-
-    this.cancel();
-  }
+  /** Collection of tool handlers for processing different tool calls. */
+  private readonly toolHandlers: Array<ToolHandler<ResponseItem>>;
 
   public sessionId: string;
   /*
@@ -263,6 +225,13 @@ export class AgentLoop {
     setSessionId(this.sessionId);
     setCurrentModel(this.model);
 
+    // Initialize tool handlers
+    this.toolHandlers = [
+      new FunctionCallHandler(this),
+      new WebSearchHandler(),
+      // Add more handlers as needed
+    ];
+
     this.hardAbort.signal.addEventListener(
       "abort",
       () => this.execAbortController?.abort(),
@@ -270,7 +239,7 @@ export class AgentLoop {
     );
   }
 
-  private async handleFunctionCall(
+  public async handleFunctionCall(
     item: ResponseFunctionToolCall,
   ): Promise<Array<ResponseInputItem>> {
     // If the agent has been canceled in the meantime we should not perform any
@@ -375,6 +344,67 @@ export class AgentLoop {
     return [outputItem, ...additionalItems];
   }
 
+  // Add a debug logging helper that can handle large objects
+  private debugLog = (message: string, obj?: unknown) => {
+    if (!isLoggingEnabled()) {
+      return;
+    }
+
+    try {
+      if (obj) {
+        const stringified =
+          typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+        log(`${message}: ${stringified}`);
+      } else {
+        log(message);
+      }
+    } catch (err) {
+      log(`${message}: [Error stringifying object: ${err}]`);
+    }
+  };
+
+  /**
+   * Process *all* tool calls contained in `responseItems` in the order they
+   * appeared. Returns the items to feed into the next OpenAI call.
+   */
+  private async processToolCalls(
+    responseItems: Array<ResponseItem>,
+    stageItem: (i: ResponseItem) => void,
+  ): Promise<Array<ResponseInputItem>> {
+    const nextTurn: Array<ResponseInputItem> = [];
+
+    this.debugLog(
+      `Processing ${responseItems.length} response items for tool calls`,
+    );
+
+    for (const item of responseItems) {
+      // Always surface the raw item to the UI.
+      stageItem(item);
+
+      // Find a handler that can process the item (first match wins).
+      const handler = this.toolHandlers.find((h) => h.canHandle(item));
+      if (!handler) {
+        continue;
+      }
+
+      // Prevent duplicate execution if we have already handled this call_id.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const callId = (item as any).call_id ?? (item as any).id;
+      if (!callId || alreadyProcessedResponses.has(callId)) {
+        continue;
+      }
+      alreadyProcessedResponses.add(callId);
+
+      // Execute tool side-effect -> gather ResponseInputItems.
+      // eslint-disable-next-line no-await-in-loop
+      const produced = await handler.handle(item as never);
+      nextTurn.push(...produced);
+    }
+
+    this.debugLog(`Generated ${nextTurn.length} input items from tool calls`);
+    return nextTurn;
+  }
+
   public async run(
     input: Array<ResponseInputItem>,
     previousResponseId: string = "",
@@ -392,14 +422,10 @@ export class AgentLoop {
         throw new Error("AgentLoop has been terminated");
       }
       // Record when we start "thinking" so we can report accurate elapsed time.
-      const _thinkingStart = Date.now(); // Renamed to avoid unused var lint error
-      // Bump generation so that any late events from previous runs can be
-      // identified and dropped.
       const thisGeneration = ++this.generation;
 
       // Reset cancellation flag and stream for a fresh run.
       this.canceled = false;
-      // DO NOT reset isWaitingForWebSearch here - it persists across turns until resolved or cancelled.
       this.currentStream = null;
 
       // Create a fresh AbortController for this run so that tool calls from a
@@ -498,18 +524,20 @@ export class AgentLoop {
                 reasoning.summary = "auto";
               }
             }
-            const prefix = `You are operating as and within the Codex CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
+            const prefix = `
+
+
+You are operating as and within the Codex CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
 
 You can:
-- Receive user prompts, project context, and local files.
-- Stream responses.
-- Execute actions using tools:
-    - Call functions you define (e.g., shell commands, code edits via \`apply_patch\`). Provide arguments as specified by the function's parameters.
-    - **Use the built-in web search tool (\`web_search_preview\`) when you need current information or knowledge beyond your training data. Call this tool like any other function, providing the search query.** Example tool call: \`{"tool": "web_search_preview", "arguments": {"query": "latest news on AI"}}\` (The system will handle the execution and provide results for you to incorporate into your final answer).
+- Receive user prompts, project context, and files.
+- Stream responses and emit function calls (e.g., shell commands, code edits).
 - Apply patches, run commands, and manage user approvals based on policy.
 - Work inside a sandboxed, git-backed workspace with rollback support.
 - Log telemetry so sessions can be replayed or inspected later.
 - More details on your functionality are available at \`codex --help\`
+- Use the web.search tool to search the web for current information.
+
 
 The Codex CLI is open-sourced. Don't confuse yourself with the old Codex language model built by OpenAI many moons ago (this is understandably top of mind for you!). Within this context, Codex refers to the open-source agentic coding interface.
 
@@ -521,6 +549,7 @@ You MUST adhere to the following criteria when executing the task:
 - Working on the repo(s) in the current environment is allowed, even if they are proprietary.
 - Analyzing code for vulnerabilities is allowed.
 - Showing user code and tool call details is allowed.
+- Use the web.search tool to search the web for current information when you need to access up-to-date documentation, recent developments, or any information that might have changed since your training data cutoff. This is especially important for questions about new technologies, current events, or evolving software libraries.
 - User instructions may overwrite the *CODING GUIDELINES* section in this developer message.
 - Use \`apply_patch\` to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
 - If completing the user's task requires writing or modifying files:
@@ -547,22 +576,42 @@ You MUST adhere to the following criteria when executing the task:
 - When your task involves writing or modifying files:
     - Do NOT tell the user to "save the file" or "copy the code into a file" if you already created or modified the file using \`apply_patch\`. Instead, reference the file as already saved.
     - Do NOT show the full contents of large files you have already written, unless the user explicitly asks for them.`;
+
             const mergedInstructions = [prefix, this.instructions]
               .filter(Boolean)
               .join("\n");
             if (isLoggingEnabled()) {
-              log(
-                `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
-              );
+              // Only log the full instructions when DEBUG_VERBOSE=1 is set
+              const debugVerbose =
+                process.env["DEBUG_VERBOSE"] === "1" ||
+                process.env["DEBUG_VERBOSE"] === "true";
+
+              if (debugVerbose) {
+                log(
+                  `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
+                );
+              } else {
+                // Just log the length and any custom instructions (not the prefix)
+                const customInstructions = this.instructions
+                  ? `Custom instructions: ${this.instructions.substring(
+                      0,
+                      100,
+                    )}${this.instructions.length > 100 ? "..." : ""}`
+                  : "No custom instructions";
+                log(
+                  `instructions (length ${mergedInstructions.length}): [PREFIX OMITTED] ${customInstructions}`,
+                );
+              }
             }
-            // eslint-disable-next-line no-await-in-loop
-            stream = await this.oai.responses.create({
+
+            // Log the request parameters
+            const requestParams = {
               model: this.model,
-              instructions: mergedInstructions,
+              instructions: `[length: ${mergedInstructions.length}]`,
               previous_response_id: lastResponseId || undefined,
               input: turnInput,
               stream: true,
-              parallel_tool_calls: false,
+              parallel_tool_calls: true,
               reasoning,
               tools: [
                 {
@@ -589,7 +638,55 @@ You MUST adhere to the following criteria when executing the task:
                   },
                 },
                 {
-                  type: "web_search_preview",
+                  type: "web_search_preview_2025_03_11",
+                  user_location: {
+                    type: "approximate",
+                    country: "GB",
+                    city: "London",
+                    timezone: "Europe/London",
+                  },
+                  search_context_size: "high",
+                },
+              ],
+            };
+
+            this.debugLog("OpenAI request parameters", requestParams);
+
+            // eslint-disable-next-line no-await-in-loop
+            stream = await this.oai.responses.create({
+              model: this.model,
+              instructions: mergedInstructions,
+              previous_response_id: lastResponseId || undefined,
+              input: turnInput,
+              stream: true,
+              parallel_tool_calls: true,
+              reasoning,
+              tools: [
+                {
+                  type: "function",
+                  name: "shell",
+                  description: "Runs a shell command, and returns its output.",
+                  strict: false, // Consider setting to true if schema adheres
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      command: { type: "array", items: { type: "string" } },
+                      workdir: {
+                        type: "string",
+                        description: "The working directory for the command.",
+                      },
+                      timeout: {
+                        type: "number",
+                        description:
+                          "The maximum time to wait for the command to complete in milliseconds.",
+                      },
+                    },
+                    required: ["command"],
+                    additionalProperties: false,
+                  },
+                },
+                {
+                  type: "web_search_preview_2025_03_11",
                   user_location: {
                     type: "approximate",
                     country: "GB",
@@ -775,7 +872,7 @@ You MUST adhere to the following criteria when executing the task:
           // `stream` might be defined; abort to avoid wasting tokens/server work
           try {
             (
-              stream as { controller?: { abort?: () => void } }
+              this.currentStream as { controller?: { abort?: () => void } }
             )?.controller?.abort?.();
           } catch {
             /* ignore */
@@ -805,6 +902,8 @@ You MUST adhere to the following criteria when executing the task:
           for await (const event of stream) {
             if (isLoggingEnabled()) {
               log(`AgentLoop.run(): response event ${event.type}`);
+              // Add detailed event logging
+              this.debugLog(`Response event details`, event);
             }
 
             // Process and surface each item (emit immediately for UI updates)
@@ -817,209 +916,21 @@ You MUST adhere to the following criteria when executing the task:
               lastResponseId = event.response.id; // Store the final response ID
               this.onLastResponseId(event.response.id);
 
-              // *** MOVED DECLARATIONS HERE ***
-              // Declare variables here, outside the status check, but inside the completed event scope
-              let webSearchResultsText: string | null = null;
-              let webSearchCallFound = false;
-              let webSearchMessageFound = false;
+              // Log the complete response
+              this.debugLog(`Complete response (ID: ${event.response.id})`, {
+                status: event.response.status,
+                outputLength: finalResponseOutput.length,
+                outputTypes: finalResponseOutput
+                  .map((item) => item?.type || "unknown")
+                  .join(", "),
+              });
 
-              // Check if the response status indicates completion, regardless of whether tools were called
-              if (event.response.status === "completed") {
-                // 1. Process Function Calls: Get inputs generated by completed function calls
-                const functionCallBasedInput =
-                  // eslint-disable-next-line no-await-in-loop
-                  await this.processEventsWithoutStreaming(
-                    // Filter first, then cast
-                    finalResponseOutput.filter(
-                      (item) => item?.type === "function_call",
-                    ) as Array<ResponseFunctionToolCall>, // Use Array<Type> syntax
-                    stageItem, // Still emit items during processing if needed by UI
-                  );
-
-                // 2. Check for Web Search Results in the *final* output (variables already declared)
-                for (let i = 0; i < finalResponseOutput.length; i++) {
-                  const item = finalResponseOutput[i];
-                  if (!item) {
-                    continue;
-                  }
-
-                  if (item.type === "web_search_call") {
-                    webSearchCallFound = true; // Mark that the call item arrived
-                    const nextItem = finalResponseOutput[i + 1];
-                    if (
-                      nextItem &&
-                      nextItem.type === "message" &&
-                      nextItem.role === "assistant" &&
-                      nextItem.content?.[0]?.type === "output_text"
-                    ) {
-                      webSearchResultsText = nextItem.content[0].text;
-                      webSearchMessageFound = true;
-                      log("Web search results found in the response.");
-                      break; // Found results
-                    } else {
-                      log(
-                        `Warning: Expected message with results after web_search_call (id: ${
-                          item.id ?? "N/A"
-                        }) but found different item type or structure.`,
-                      );
-                    }
-                  }
-                }
-
-                // 3. Determine if the agent *intended* to search (based on its last message)
-                // This is a heuristic - might need refinement based on actual agent output patterns
-                let agentIndicatedSearch = false;
-                const lastMessageItem = finalResponseOutput.findLast(
-                  (item): item is AnyResponseMessage =>
-                    item?.type === "message" && item.role === "assistant",
-                );
-                if (
-                  lastMessageItem?.content?.[0]?.type === "output_text" &&
-                  !webSearchCallFound // Only check intent if the call wasn't already present
-                ) {
-                  const text = lastMessageItem.content[0].text.toLowerCase();
-                  // Simple check, might need to be more robust
-                  if (
-                    text.includes("search") ||
-                    text.includes("fetching") ||
-                    text.includes("looking up")
-                  ) {
-                    agentIndicatedSearch = true;
-                    log("Agent message indicates web search intent.");
-                  }
-                }
-
-                // 4. Construct the input for the *next* API call (if any).
-                let nextTurnInputItems: Array<ResponseInputItem> = [
-                  ...functionCallBasedInput,
-                ];
-
-                // If web search results were found *in this response*, prepend the system message.
-                if (webSearchResultsText != null) {
-                  // eslint fix: !== to !=
-                  log("Prepending web search results to next turn input.");
-                  const resultsSystemMessage: ResponseInputItem.Message = {
-                    role: "system",
-                    content: [
-                      {
-                        type: "input_text",
-                        text: `Web search results received:\n\n${webSearchResultsText}`,
-                      },
-                    ],
-                  };
-                  nextTurnInputItems.unshift(resultsSystemMessage);
-                  this.isWaitingForWebSearch = false; // Results received, no longer waiting
-                }
-                // *** NEW LOGIC for ASYNC web search handling ***
-                else if (
-                  agentIndicatedSearch &&
-                  !webSearchCallFound &&
-                  !this.isWaitingForWebSearch
-                ) {
-                  // Agent indicated search, results not here yet, and we weren't already waiting
-                  log(
-                    "Agent indicated search, but results not found in this response. Setting wait state and keeping loop alive.",
-                  );
-                  this.isWaitingForWebSearch = true; // Set waiting state
-                  // Provide a dummy input to ensure the loop continues.
-                  // An empty array would terminate the loop.
-                  nextTurnInputItems = [
-                    {
-                      type: "message", // Correct type
-                      role: "system", // Add role
-                      content: [
-                        {
-                          type: "input_text", // Correct content type
-                          text: "Waiting for web search results...",
-                        },
-                      ],
-                    },
-                  ];
-                } else if (this.isWaitingForWebSearch && !webSearchCallFound) {
-                  // We were waiting, but results still haven't arrived. Keep waiting.
-                  log(
-                    "Still waiting for web search results from previous turn. Keeping loop alive.",
-                  );
-                  nextTurnInputItems = [
-                    {
-                      type: "message", // Correct type
-                      role: "system", // Add role
-                      content: [
-                        {
-                          type: "input_text", // Correct content type
-                          text: "Still waiting for web search results...",
-                        },
-                      ],
-                    },
-                  ];
-                } else if (
-                  this.isWaitingForWebSearch &&
-                  webSearchCallFound &&
-                  !webSearchMessageFound
-                ) {
-                  // We were waiting, the call arrived, but no valid results message followed (error?). Stop waiting.
-                  log(
-                    "Web search call arrived while waiting, but no valid results message found. Stopping wait.",
-                  );
-                  this.isWaitingForWebSearch = false;
-                  // Let nextTurnInputItems be determined by function calls (potentially empty).
-                } else if (
-                  this.isWaitingForWebSearch &&
-                  webSearchCallFound &&
-                  webSearchMessageFound
-                ) {
-                  // This case should be handled by the `webSearchResultsText !== null` block above,
-                  // but added for clarity. If results arrive while waiting, the flag is cleared there.
-                  log(
-                    "Web search results arrived while waiting. State handled.",
-                  );
-                }
-
-                // 5. Assign the constructed inputs back to turnInput to potentially continue the loop.
-                turnInput = nextTurnInputItems;
-
-                // Stage the final complete output items for the flush stage
-                // This loop now safely uses webSearchResultsText which is guaranteed to be defined
-                if (thisGeneration === this.generation && !this.canceled) {
-                  for (const item of finalResponseOutput) {
-                    // Avoid re-staging function calls handled by processEventsWithoutStreaming
-                    // Also avoid staging the web_search_call/message pair if results were handled
-                    if (
-                      item.type !== "function_call" &&
-                      !(
-                        (
-                          item.type === "web_search_call" &&
-                          webSearchResultsText != null
-                        ) // eslint fix: !== to != // webSearchResultsText is defined here
-                      ) &&
-                      !(
-                        (
-                          item.type === "message" &&
-                          item.role === "assistant" &&
-                          item.content?.[0]?.type === "output_text" &&
-                          item.content[0].text === webSearchResultsText && // Also check text isn't null here implicitly
-                          webSearchResultsText != null
-                        ) // Explicitly check webSearchResultsText is not null // webSearchResultsText is defined here
-                      )
-                    ) {
-                      stageItem(item as ResponseItem);
-                    }
-                  }
-                }
-              } else {
-                // Handle non-completed status
-                // If response status is not 'completed' (e.g., 'failed', 'requires_action'),
-                // clear turnInput to stop the loop unless function calls require action.
-                this.isWaitingForWebSearch = false; // Stop waiting if response failed
-                turnInput = await this.processEventsWithoutStreaming(
-                  // Filter first, then cast
-                  finalResponseOutput.filter(
-                    (item) => item?.type === "function_call",
-                  ) as Array<ResponseFunctionToolCall>, // Use Array<Type> syntax
-                  stageItem,
-                );
-                // Note: The staging loop from the 'if (status === "completed")' block does not run here.
-              }
+              // Process all tool calls using the unified handler regardless of status
+              // eslint-disable-next-line no-await-in-loop
+              turnInput = await this.processToolCalls(
+                finalResponseOutput,
+                stageItem,
+              );
             } // End of else if (event.type === "response.completed")
             // Handle other streaming events if necessary (e.g., deltas)
             // For now, focus is on processing after "response.completed"
@@ -1047,6 +958,11 @@ You MUST adhere to the following criteria when executing the task:
             .map((i) => i.type)
             .join(", ")}`,
         );
+
+        // Add detailed logging of the next turn input
+        if (turnInput.length > 0) {
+          this.debugLog("Detailed next turn input", turnInput);
+        }
       } // End while loop
 
       // Flush staged items if the run concluded successfully (i.e. the user did
@@ -1073,11 +989,7 @@ You MUST adhere to the following criteria when executing the task:
         // Also clear the web search waiting state if the loop finished naturally.
         if (!this.canceled && !this.hardAbort.signal.aborted) {
           this.pendingAborts.clear();
-          // Only clear waiting state if loop ended naturally (turnInput became empty)
-          // If it ended due to cancellation/termination, it's already cleared.
-          if (turnInput.length === 0) {
-            this.isWaitingForWebSearch = false;
-          }
+          // NOTE: Web search state (if needed later) would be cleared here if turnInput.length === 0
         }
 
         // Commented out thinking time logs
@@ -1118,7 +1030,6 @@ You MUST adhere to the following criteria when executing the task:
         } catch {
           /* no‑op – emitting the error message is best‑effort */
         }
-        this.isWaitingForWebSearch = false; // Reset state on error
         this.onLoading(false);
         return;
       }
@@ -1211,49 +1122,98 @@ You MUST adhere to the following criteria when executing the task:
         } catch {
           /* best‑effort */
         }
-        this.isWaitingForWebSearch = false; // Reset state on error
         this.onLoading(false);
         return;
       }
 
       // Re‑throw all other errors so upstream handlers can decide what to do.
-      this.isWaitingForWebSearch = false; // Reset state on unexpected error
+      /* this._isWaitingForWebSearch = false; */ // Reset state on unexpected error (variable removed)
       throw err;
     }
   }
 
-  // we need until we can depend on streaming events
+  // Maintained for backward compatibility - delegates to processToolCalls
+  /* eslint-disable-next-line @typescript-eslint/no-unused-vars */
   private async processEventsWithoutStreaming(
-    output: Array<ResponseFunctionToolCall>, // Now specifically takes function calls
+    output: Array<ResponseFunctionToolCall>,
     emitItem: (item: ResponseItem) => void,
   ): Promise<Array<ResponseInputItem>> {
-    // If the agent has been canceled we should short‑circuit immediately.
+    this.debugLog(
+      `processEventsWithoutStreaming called (deprecated), delegating to processToolCalls`,
+    );
+
     if (this.canceled) {
       return [];
     }
 
-    const nextTurnInput: Array<ResponseInputItem> = [];
-    // Web search result handling MUST happen outside this function
+    // Simply delegate to the new unified handler - cast to ensure compatibility
+    return this.processToolCalls(
+      output as unknown as Array<ResponseItem>,
+      emitItem,
+    );
+  }
 
-    for (const item of output) {
-      // Emit the item for the UI regardless of its type
-      emitItem(item as ResponseItem); // Cast to base type expected by emitItem
+  /**
+   * Cancel the current run. This aborts any active request to OpenAI and
+   * rejects all pending promises so the UI can promptly return to the idle
+   * state and listen for the next user input. This is typically invoked
+   * when the user presses ESC.
+   */
+  public cancel(): void {
+    if (isLoggingEnabled()) {
+      log(`AgentLoop.cancel(): generation=${this.generation}`);
+    }
+    // Bump the generation counter so any in-flight tool handle results get
+    // dropped. We want to prevent callbacks from a canceled run from emitting
+    // items that might confuse the user (e.g. by seeing commands execute even
+    // though they hit ESC).
+    this.generation++;
+    this.canceled = true;
 
-      // This function now ONLY handles function_calls to generate the next input turn
-      // Prefer call_id (responses API), fallback to id (Chat Completions)
-      const callId = item.call_id ?? item.id;
-      if (!callId || alreadyProcessedResponses.has(callId)) {
-        continue;
+    // If there's an active request to OpenAI underway, signal the controller to
+    // abort so we don't waste tokens generating a response that the user won't
+    // see. This also avoids having the user wait for the full API response.
+    try {
+      (
+        this.currentStream as { controller?: { abort?: () => void } }
+      )?.controller?.abort?.();
+    } catch (err) {
+      // Swallow errors from aborting the stream so that the cancel operation
+      // itself does not crash.
+      if (isLoggingEnabled()) {
+        log(`AgentLoop.cancel(): error aborting stream: ${err}`);
       }
-      alreadyProcessedResponses.add(callId);
-
-      // Item is already ResponseFunctionToolCall, safe for handleFunctionCall
-      // eslint-disable-next-line no-await-in-loop
-      const result = await this.handleFunctionCall(item);
-      nextTurnInput.push(...result);
     }
 
-    // Return only the inputs generated from function calls
-    return nextTurnInput;
+    // Any function_call tool IDs that have been seen should be tracked. We
+    // will emit synthetic "aborted" outputs for them on the next run() so
+    // that the OpenAI API does not raise the "No tool output found for" error.
+    if (this.currentStream) {
+      // This is an ordered list of all call_ids emitted by the model for the
+      // current run. We won't get events for any of them, so we do want to
+      // emit synthetic "aborted" outputs to prevent API errors next time.
+      // More context on this in the private `handleFunctionCallAbandoned`
+      // method and in run().
+      // Find and record any call_ids that were seen by the stream.
+      for (const id of alreadyProcessedResponses) {
+        if (typeof id === "string") {
+          this.pendingAborts.add(id);
+        }
+      }
+    }
+  }
+
+  /**
+   * Permanently disable this instance. Cancels any active run and prevents
+   * any future runs. This is called when the UI is about to be torn down, e.g.
+   * when switching models or starting a new session.
+   */
+  public terminate(): void {
+    if (isLoggingEnabled()) {
+      log("AgentLoop.terminate(): terminating instance");
+    }
+    this.cancel();
+    this.terminated = true;
+    this.hardAbort.abort();
   }
 }

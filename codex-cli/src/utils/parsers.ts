@@ -16,7 +16,28 @@ export function parseToolCallOutput(toolCallOutput: string): {
   metadata: ExecOutputMetadata;
 } {
   try {
-    const { output, metadata } = JSON.parse(toolCallOutput);
+    const parsed = JSON.parse(toolCallOutput);
+    const output =
+      typeof parsed.output === "string"
+        ? parsed.output
+        : parsed.status
+        ? `${parsed.status}: ${parsed.message || ""}`
+        : toolCallOutput;
+
+    // Ensure metadata always has our expected fields
+    const parsedMetadata = parsed.metadata || {};
+    const metadata: ExecOutputMetadata = {
+      exit_code:
+        typeof parsedMetadata.exit_code !== "undefined"
+          ? parsedMetadata.exit_code
+          : 0,
+      duration_seconds:
+        typeof parsedMetadata.duration_seconds !== "undefined"
+          ? parsedMetadata.duration_seconds
+          : 0,
+      ...parsedMetadata, // Keep any additional metadata fields
+    };
+
     return {
       output,
       metadata,
